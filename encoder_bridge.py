@@ -1,14 +1,90 @@
 #!/usr/bin/env python3
-import asyncio, json, os, glob
+import asyncio, json, os, glob, ssl
 from aiohttp import web
 import serial
 import serial_asyncio
 
 # Configuration - Change this to switch between MAC and PI modes
-MODE = "MAC"  # Options: "MAC" or "PI"
+MODE = "PI"  # Options: "MAC" or "PI"
 
 HTTP_PORT = 8765
+HTTPS_PORT = 8766
 SERIAL_BAUD = 115200
+
+# SSL Configuration
+SSL_CERT_FILE = "cert.pem"
+SSL_KEY_FILE = "key.pem"
+
+def create_self_signed_cert():
+    """Create a self-signed SSL certificate if it doesn't exist"""
+    if os.path.exists(SSL_CERT_FILE) and os.path.exists(SSL_KEY_FILE):
+        print(f"[ssl] Using existing certificates: {SSL_CERT_FILE}, {SSL_KEY_FILE}")
+        return
+    
+    try:
+        from cryptography import x509
+        from cryptography.x509.oid import NameOID
+        from cryptography.hazmat.primitives import hashes, serialization
+        from cryptography.hazmat.primitives.asymmetric import rsa
+        from datetime import datetime, timedelta
+        
+        print("[ssl] Generating self-signed certificate...")
+        
+        # Generate private key
+        private_key = rsa.generate_private_key(
+            public_exponent=65537,
+            key_size=2048,
+        )
+        
+        # Create certificate
+        subject = issuer = x509.Name([
+            x509.NameAttribute(NameOID.COUNTRY_NAME, "US"),
+            x509.NameAttribute(NameOID.STATE_OR_PROVINCE_NAME, "CA"),
+            x509.NameAttribute(NameOID.LOCALITY_NAME, "San Francisco"),
+            x509.NameAttribute(NameOID.ORGANIZATION_NAME, "Rotary Encoder Bridge"),
+            x509.NameAttribute(NameOID.COMMON_NAME, "localhost"),
+        ])
+        
+        cert = x509.CertificateBuilder().subject_name(
+            subject
+        ).issuer_name(
+            issuer
+        ).public_key(
+            private_key.public_key()
+        ).serial_number(
+            x509.random_serial_number()
+        ).not_valid_before(
+            datetime.utcnow()
+        ).not_valid_after(
+            datetime.utcnow() + timedelta(days=365)
+        ).add_extension(
+            x509.SubjectAlternativeName([
+                x509.DNSName("localhost"),
+                x509.DNSName("127.0.0.1"),
+                x509.IPAddress("127.0.0.1"),
+                x509.IPAddress("0.0.0.0"),
+            ]),
+            critical=False,
+        ).sign(private_key, hashes.SHA256())
+        
+        # Write certificate and key to files
+        with open(SSL_CERT_FILE, "wb") as f:
+            f.write(cert.public_bytes(serialization.Encoding.PEM))
+        
+        with open(SSL_KEY_FILE, "wb") as f:
+            f.write(private_key.private_bytes(
+                encoding=serialization.Encoding.PEM,
+                format=serialization.PrivateFormat.PKCS8,
+                encryption_algorithm=serialization.NoEncryption()
+            ))
+        
+        print(f"[ssl] Generated certificates: {SSL_CERT_FILE}, {SSL_KEY_FILE}")
+        
+    except ImportError:
+        print("[ssl] cryptography library not found. Install with: pip install cryptography")
+        print("[ssl] You can also generate certificates manually using openssl:")
+        print(f"[ssl]   openssl req -x509 -newkey rsa:4096 -keyout {SSL_KEY_FILE} -out {SSL_CERT_FILE} -days 365 -nodes")
+        raise
 
 def find_serial_port():
     if MODE == "MAC":
@@ -184,9 +260,25 @@ async def main():
     ])
     runner = web.AppRunner(app)
     await runner.setup()
-    site = web.TCPSite(runner, "0.0.0.0", HTTP_PORT)
-    await site.start()
+    
+    # Start HTTP server
+    http_site = web.TCPSite(runner, "0.0.0.0", HTTP_PORT)
+    await http_site.start()
     print(f"[http] serving http/ws on :{HTTP_PORT}")
+    
+    # Start HTTPS server
+    try:
+        create_self_signed_cert()
+        ssl_context = ssl.create_default_context(ssl.Purpose.CLIENT_AUTH)
+        ssl_context.load_cert_chain(SSL_CERT_FILE, SSL_KEY_FILE)
+        
+        https_site = web.TCPSite(runner, "0.0.0.0", HTTPS_PORT, ssl_context=ssl_context)
+        await https_site.start()
+        print(f"[https] serving https/wss on :{HTTPS_PORT}")
+    except Exception as e:
+        print(f"[https] Failed to start HTTPS server: {e}")
+        print("[https] Continuing with HTTP only...")
+    
     await serial_reader_task()
 
 if __name__ == "__main__":
